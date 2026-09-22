@@ -55,28 +55,86 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
+const OWNER_FILE = join(STATE_DIR, 'bot.owner')
+
+// MARVEEN-PATCH: poller-slot guard
+// Egy bot-tokenre a Telegram EGY getUpdates-fogyasztót enged. A nem-csatorna
+// sessionök (Task-subagens, ad-hoc terminál) MCP-szervere ugyanezt az
+// állapot-könyvtárat oldja fel, elveszi a slotot, majd a saját Claude Code-ja
+// eldobja a bejövő értesítést ("not in --channels list") -- a fő csatorna
+// megnémul. Ezért a szülő-láncban megkeressük az ELSŐ claude processzt, és
+// csak akkor pollozunk, ha annak a parancssorában ott a '--channels'.
+// Mérve ezen a gépen: a lánc bun server.ts -> 'bun run' wrapper -> claude,
+// tehát a közvetlen szülő nem elég. A parancssorában 'claude'-ot tartalmazó
+// bash-wrapper NEM claude, ezért az argv[0] bázisneve dönt.
+// FAIL-OPEN: ha a lánc nem mérhető (ps hiba, üres sor, nincs claude a
+// láncban), null-t adunk, és pollozunk -- egy téves "ne pollozz" a fő
+// csatornát némítaná el, egy téves "pollozz" legrosszabb esetben 409
+// Conflict, amit a lenti retry-hurok kezel.
+function findChannelSessionFlag(): boolean | null {
+  let pid = process.ppid
+  for (let step = 0; step < 16 && pid > 1; step++) {
+    let line: string
+    try {
+      line = execFileSync('ps', ['-o', 'ppid=,command=', '-p', String(pid)],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    } catch { return null }
+    const m = line.match(/^\s*(\d+)\s+([\s\S]*)$/)
+    if (!m) return null
+    const parent = parseInt(m[1], 10)
+    const command = m[2]
+    const argv0 = command.split(' ')[0]
+    if (argv0 === 'claude' || argv0.endsWith('/claude')) return command.includes('--channels')
+    if (!Number.isFinite(parent) || parent <= 1) break
+    pid = parent
+  }
+  return null
+}
+const CHANNEL_SESSION = findChannelSessionFlag()
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    // PID files race with OS PID recycling — verify the holder is actually a
-    // server.ts process before SIGTERM. Otherwise a recycled PID can point at
-    // our own bun-run wrapper (kills our stdin → immediate self-shutdown) or
-    // an unrelated user process.
-    const cmd = execFileSync('ps', ['-p', String(stale), '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-    if (cmd.includes('server.ts')) {
-      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-      process.kill(stale, 'SIGTERM')
+let stateDirId: string
+try { stateDirId = realpathSync(STATE_DIR) } catch { stateDirId = STATE_DIR }
+if (CHANNEL_SESSION === false) {
+  // Nem-csatorna session: a bot.pid-hez hozzá sem nyúlunk -- se olvasás-kilövés,
+  // se írás. Így a bot.pid a VALÓDI poller azonosítója marad, és nem egy siket,
+  // mégis élő PID mutat "egészséges" csatornát a watchdognak.
+  process.stderr.write(
+    'telegram channel: not a --channels session — poller slot left untouched (bot.pid not read, not written)\n',
+  )
+} else {
+  try {
+    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (stale > 1 && stale !== process.pid) {
+      process.kill(stale, 0)
+      // PID files race with OS PID recycling — verify the holder is actually a
+      // server.ts process before SIGTERM. Otherwise a recycled PID can point at
+      // our own bun-run wrapper (kills our stdin → immediate self-shutdown) or
+      // an unrelated user process.
+      const cmd = execFileSync('ps', ['-p', String(stale), '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      // TULAJDONOS-KÖTÖTT KILÖVÉS (fail-closed): a bot.owner a FELOLDOTT
+      // állapot-könyvtár útja. Hiányzó jelölő = a patch előtti poller -- azt
+      // visszafelé kompatibilisen a miénknek vesszük, különben a bevezetés
+      // pillanatában árva pollert hagynánk a fő csatornán.
+      let staleOwner: string | null = null
+      try { staleOwner = readFileSync(OWNER_FILE, 'utf8').trim() || null } catch {}
+      if (staleOwner !== null && staleOwner !== stateDirId) {
+        process.stderr.write(
+          `telegram channel: stale poller pid=${stale} is owned by ${staleOwner}, not ${stateDirId} — leaving it alone\n`,
+        )
+      } else if (cmd.includes('server.ts')) {
+        process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+        process.kill(stale, 'SIGTERM')
+      }
     }
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+  } catch {}
+  writeFileSync(PID_FILE, String(process.pid))
+  writeFileSync(OWNER_FILE, stateDirId)
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -407,7 +465,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">, plus reply_to_message_id="..." when the sender used Telegram\'s reply-to-message feature (its value is the message_id of the message they replied to). If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -661,7 +719,13 @@ function shutdown(): void {
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
   try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) {
+      // A jelölő a PID-del EGYÜTT él. ELŐSZÖR a jelölő: ha az egyik törlés
+      // elbukik, a maradék állapot a mai (jelölő nélküli) viselkedés felé
+      // essen, ne egy idegen jelölő felé, ami tartósan blokkolná a slotot.
+      try { rmSync(OWNER_FILE) } catch {}
+      rmSync(PID_FILE)
+    }
   } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
@@ -1030,7 +1094,14 @@ bot.catch(err => {
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
-void (async () => {
+if (CHANNEL_SESSION === false) {
+  // Ez a sor mondja meg, miért néma ez a szerver. A kimenő toolok és az
+  // mcp.connect VÁLTOZATLANUL működnek -- a válasz-küldés HTTP-n megy, nem a
+  // polling-slotból.
+  process.stderr.write(
+    'telegram channel: no --channels claude in the parent process chain — polling disabled (outbound tools still work)\n',
+  )
+} else void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
