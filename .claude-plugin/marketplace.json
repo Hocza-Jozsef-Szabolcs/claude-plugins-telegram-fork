@@ -1,10 +1,9 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-plugins-official",
-  "description": "Directory of popular Claude Code extensions including development tools, productivity plugins, and MCP integrations",
+  "name": "jarvis-telegram-fork",
+  "description": "Telegram channel plugin fork with local fixes not accepted upstream (reply_to_message_id, ack-tied-to-delivery). Not affiliated with Anthropic.",
   "owner": {
-    "name": "Anthropic",
-    "email": "support@anthropic.com"
+    "name": "Hocza-Jozsef-Szabolcs"
   },
   "renames": {
     "adlc": "agentforce-adlc",
